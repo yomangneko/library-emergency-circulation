@@ -127,6 +127,21 @@ class EmergencyLibraryApp:
         self.book_entry.bind("<Return>", lambda e: self.record())
         self.book_entry.bind("<KP_Enter>", lambda e: self.record())
 
+        # 아래쪽(상태 줄 · 단추)을 먼저 붙여 자리를 잡고, 남는 자리를 목록이 쓴다
+        self.status = tk.Label(r, anchor="w", font=(FONT, 11), padx=12, pady=6, relief="sunken", bd=1,
+                               wraplength=950, justify="left")
+        # 문구가 두 줄이 되어도 잘리지 않게: 상태 줄 · 아래 단추를 목록보다 먼저 아래에 붙이고 폭에 맞춰 접는다
+        self.status.bind("<Configure>", lambda e: self.status.configure(wraplength=max(200, e.width - 30)))
+        self.status.pack(fill="x", side="bottom")
+
+        bottom = ttk.Frame(r, padding=(12, 0, 12, 4))
+        bottom.pack(fill="x", side="bottom")
+        ttk.Button(bottom, text="오늘 엑셀 열기", command=self.open_today_excel).pack(side="left")
+        ttk.Button(bottom, text="저장 폴더 열기", command=self.open_folder).pack(side="left", padx=6)
+        ttk.Button(bottom, text="입력 초기화 (ESC)", command=self.reset_inputs).pack(side="left")
+        self.folder_label = ttk.Label(bottom, foreground="#777777", text=f"저장 폴더: {self.store.folder}")
+        self.folder_label.pack(side="right")
+
         listbox = ttk.LabelFrame(r, text="오늘 기록", padding=8)
         listbox.pack(fill="both", expand=True, padx=12, pady=8)
         cols = ("시각", "구분", "회원", "도서")
@@ -140,17 +155,6 @@ class EmergencyLibraryApp:
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        bottom = ttk.Frame(r, padding=(12, 0, 12, 4))
-        bottom.pack(fill="x")
-        ttk.Button(bottom, text="오늘 엑셀 열기", command=self.open_today_excel).pack(side="left")
-        ttk.Button(bottom, text="저장 폴더 열기", command=self.open_folder).pack(side="left", padx=6)
-        ttk.Button(bottom, text="입력 초기화 (ESC)", command=self.reset_inputs).pack(side="left")
-        self.folder_label = ttk.Label(bottom, foreground="#777777", text=f"저장 폴더: {self.store.folder}")
-        self.folder_label.pack(side="right")
-
-        self.status = tk.Label(r, anchor="w", font=(FONT, 11), padx=12, pady=6, relief="sunken", bd=1,
-                               wraplength=950, justify="left")
-        self.status.pack(fill="x", side="bottom")
 
         r.bind("<F1>", lambda e: self.set_mode(core.KIND_LOAN))
         r.bind("<F2>", lambda e: self.set_mode(core.KIND_RETURN))
