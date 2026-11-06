@@ -233,8 +233,8 @@ class Layout:
 def _classify(vals: Sequence) -> Tuple[str, object]:
     """한 줄(A열부터의 값들)을 가른다 → ("record", Row) / ("label", [(열, 라벨)]) / ("other", None).
 
-    기록 줄 판정 규칙:
-      A(처리시간)가 날짜 · 시각 값이거나 「YYYY-MM-DD HH:MM:SS」 글자이고,
+    기록 줄 판정 규칙(사서 결정 「나」 261107):
+      A(처리시간)가 비어 있지 않고(글자 · 날짜 · 시각 값 무엇이든 — 꼴은 따지지 않는다),
       B(구분)가 「대출」 또는 「반납」이고(앞뒤 공백 무시),
       D(도서번호)가 비어 있지 않은 줄. C(회원번호)는 따지지 않는다(기존 판 파일).
     합계 줄: 어느 칸이든 「전체 건수 · 대출 건수 · 반납 건수」 라벨이 있는 줄.
@@ -245,11 +245,8 @@ def _classify(vals: Sequence) -> Tuple[str, object]:
     if labels:
         return "label", labels
     a, b, c, d = vals[:4]
-    if isinstance(a, _dt.datetime):
-        t = a.strftime(TIME_FORMAT)
-    elif isinstance(a, str) and TIME_RE.fullmatch(a.strip()):
-        t = a.strip()
-    else:
+    t = _time_text(a)
+    if not t:
         return "other", None
     if not (isinstance(b, str) and b.strip() in KINDS):
         return "other", None
@@ -257,6 +254,136 @@ def _classify(vals: Sequence) -> Tuple[str, object]:
     if not book.strip():
         return "other", None
     return "record", Row(t, b.strip(), "" if c is None else str(c), book)
+
+
+def _time_text(a) -> str:
+    """처리시간 칸의 값을 글자로(화면 목록 · 일지와 맞춰 보기용). 비어 있으면 ""."""
+    if a is None:
+        return ""
+    if isinstance(a, _dt.datetime):
+        return a.strftime(TIME_FORMAT)
+    if isinstance(a, _dt.date):
+        return a.strftime("%Y-%m-%d")
+    if isinstance(a, _dt.time):  # 직원이 「9:30」을 쳐서 엑셀이 시각 값으로 바꾼 칸
+        return a.strftime("%H:%M:%S")
+    if isinstance(a, _dt.timedelta):
+        return str(a)
+    return str(a).strip()
+
+
+# ---------------------------------------------------------------- 수식 칸 이름 고치기(㉹)
+
+_CELL_RE = re.compile(r"(\$?)([A-Za-z]{1,3})(\$?)(\d+)")
+_COLS_RE = re.compile(r"\$?[A-Za-z]{1,3}:\$?[A-Za-z]{1,3}")
+_ROWS_RE = re.compile(r"(\$?)(\d+):(\$?)(\d+)")
+
+
+def _shift_ref(ref: str, at_row: int, k: int) -> str:
+    """칸 이름 하나(시트 이름 뗀 것)를 엑셀에서 at_row 자리에 k줄을 끼웠을 때처럼 고친다. 못 읽으면 ValueError."""
+    def row(n: int) -> int:
+        return n + k if n >= at_row else n
+
+    if ref.upper() == "#REF!":
+        return ref
+    parts = ref.split(":")
+    if len(parts) == 1:
+        m = _CELL_RE.fullmatch(ref)
+        if not m:
+            raise ValueError(ref)
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{row(int(m.group(4)))}"
+    if len(parts) == 2:
+        if _COLS_RE.fullmatch(ref):
+            return ref  # 열 전체(A:D)는 줄 끼우기와 상관없다
+        m = _ROWS_RE.fullmatch(ref)
+        if m:
+            return f"{m.group(1)}{row(int(m.group(2)))}:{m.group(3)}{row(int(m.group(4)))}"
+        a, b = (_CELL_RE.fullmatch(x) for x in parts)
+        if a and b:
+            return (f"{a.group(1)}{a.group(2)}{a.group(3)}{row(int(a.group(4)))}:"
+                    f"{b.group(1)}{b.group(2)}{b.group(3)}{row(int(b.group(4)))}")
+    raise ValueError(ref)
+
+
+def _split_sheet(operand: str) -> Tuple[Optional[str], str]:
+    """'시트'!A1 → (시트, A1). 바깥 파일 · 여러 시트 걸친 이름은 ValueError."""
+    if "!" not in operand:
+        return None, operand
+    sheet, ref = operand.rsplit("!", 1)
+    if sheet.startswith("'") and sheet.endswith("'") and len(sheet) >= 2:
+        sheet = sheet[1:-1].replace("''", "'")
+    elif "'" in sheet:
+        raise ValueError(operand)
+    if "[" in sheet or "]" in sheet or ":" in sheet:
+        raise ValueError(operand)  # 바깥 파일 · 3차원 참조
+    return sheet, ref
+
+
+def _shift_formula_text(text: str, home_sheet: str, target_sheet: str, at_row: int, k: int) -> str:
+    """수식 글자 안에서 target_sheet 를 가리키는 칸 이름만 고친다. 못 읽는 꼴이면 ValueError."""
+    from openpyxl.formula.tokenizer import Token, Tokenizer
+
+    tok = Tokenizer(text)
+    changed = False
+    for t in tok.items:
+        if t.type == Token.OPERAND and t.subtype == Token.RANGE:
+            sheet, ref = _split_sheet(t.value)
+            if (sheet if sheet is not None else home_sheet) != target_sheet:
+                # 다른 시트를 가리킨다 — 그래도 읽을 수 있는 꼴인지는 확인한다
+                _shift_ref(ref, 10 ** 9, 0)
+                continue
+            new = _shift_ref(ref, at_row, k)
+            if new != ref:
+                t.value = t.value[: len(t.value) - len(ref)] + new
+                changed = True
+    return tok.render() if changed else text
+
+
+class FormulaError(ExcelFormatError):
+    pass
+
+
+def _shift_all_formulas(wb, target_sheet: str, at_row: int, k: int) -> int:
+    """줄을 끼운 뒤 파일 안 모든 수식 · 정의된 이름의 칸 이름을 고친다. 고친 칸 수를 돌려준다.
+    고칠 수 없는 수식을 만나면 FormulaError — 그 파일에는 쓰지 않는다(틀린 칸을 가리키는 채 저장 금지)."""
+    from openpyxl.worksheet.formula import ArrayFormula, DataTableFormula
+
+    n = 0
+    for ws in wb.worksheets:
+        for c in list(ws._cells.values()):  # 값이 있는 칸만(줄 수만큼 빈 칸을 만들지 않게)
+            if True:
+                v = c.value
+                if isinstance(v, (ArrayFormula, DataTableFormula)):
+                    raise FormulaError(f"{ws.title}!{c.coordinate} 배열 · 데이터 표 수식은 고칠 수 없습니다")
+                if isinstance(v, str) and v.startswith("=") and c.data_type == "f":
+                    try:
+                        new = _shift_formula_text(v, ws.title, target_sheet, at_row, k)
+                    except Exception:
+                        raise FormulaError(f"{ws.title}!{c.coordinate} 수식을 읽지 못해 고칠 수 없습니다")
+                    if new != v:
+                        c.value = new
+                        n += 1
+    names = []
+    try:
+        names.extend(wb.defined_names.values())
+    except AttributeError:
+        pass
+    for ws in wb.worksheets:
+        try:
+            names.extend(ws.defined_names.values())
+        except AttributeError:
+            pass
+    for dn in names:
+        if dn.name.startswith("_xlnm."):
+            continue  # 인쇄 영역 · 필터 등 엑셀 예약 이름 — 프로그램이 다시 정한다
+        text = dn.attr_text or ""
+        try:
+            new = _shift_formula_text("=" + text, target_sheet + "\x00", target_sheet, at_row, k)[1:]
+        except Exception:
+            raise FormulaError(f"이름 「{dn.name}」의 참조를 읽지 못해 고칠 수 없습니다")
+        if new != text:
+            dn.attr_text = new
+            n += 1
+    return n
 
 
 def _scan_layout(ws) -> Layout:
@@ -338,6 +465,8 @@ def write_rows_and_totals(ws, layout, new_rows: Sequence[Row]) -> List[Row]:
                 moved.append((rng.min_row, rng.min_col, rng.max_row, rng.max_col))
                 ws.unmerge_cells(str(rng))
         ws.insert_rows(last + 1, k)
+        # openpyxl 은 줄을 끼워도 수식의 칸 이름을 고치지 않는다 — 엑셀에서 끼운 것과 같게 고친다(㉹)
+        _shift_all_formulas(ws.parent, ws.title, last + 1, k)
         for r1, c1, r2, c2 in moved:
             ws.merge_cells(start_row=r1 + k, start_column=c1, end_row=r2 + k, end_column=c2)
         labels = [(r + k if r > last else r, c, lab) for r, c, lab in labels]
