@@ -95,8 +95,9 @@ class EmergencyLibraryApp:
         self.set_status("준비되었습니다", OK)
         self.worker.start()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
-        self.root.after(POLL_MS, self._poll_results)
-        self.root.after(30_000, self._tick)
+        self._closed = False
+        self._poll_job = self.root.after(POLL_MS, self._poll_results)
+        self._tick_job = self.root.after(30_000, self._tick)
 
     # ------------------------------------------------------------ 화면 짓기
     def _build(self) -> None:
@@ -270,7 +271,8 @@ class EmergencyLibraryApp:
                     break
                 self._apply_result(res)
         finally:
-            self.root.after(POLL_MS, self._poll_results)
+            if not self._closed:
+                self._poll_job = self.root.after(POLL_MS, self._poll_results)
 
     def _apply_result(self, res: core.FlushResult) -> None:
         # 엑셀에 들어간 줄은 「엑셀 대기」 표시를 푼다
@@ -299,6 +301,12 @@ class EmergencyLibraryApp:
     def close(self) -> None:
         """창 닫기. 엑셀 정리 중이면 잠깐 기다린다 — 다 못 기다려도 엑셀 파일은 임시 파일로 바꿔 끼우므로
         깨지지 않고, 못 옮긴 줄은 다음 시작 때 일지에서 채운다."""
+        self._closed = True
+        for job in (self._poll_job, self._tick_job):
+            try:
+                self.root.after_cancel(job)
+            except tk.TclError:
+                pass
         try:
             self.worker.stop(timeout=2.0)
         finally:
@@ -335,7 +343,8 @@ class EmergencyLibraryApp:
                 self.refresh_list()
                 self.set_status(f"날짜가 바뀌었습니다 — {self.shown_day:%Y-%m-%d} 파일에 기록합니다", WARN)
         finally:
-            self.root.after(30_000, self._tick)
+            if not self._closed:
+                self._tick_job = self.root.after(30_000, self._tick)
 
 
 def main() -> int:
