@@ -1,0 +1,87 @@
+name: 윈도우 빌드
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 도구 설치
+        run: python -m pip install -r requirements.txt pyinstaller==6.11.1 pillow==11.0.0
+
+      - name: 게이트 (기록 처리 · 윈도우 실제 파일 잠금)
+        run: python -I -X utf8 tests/gates.py --windows
+
+      - name: 화면 스모크 + 사진 (인터넷 차단)
+        run: python -I -X utf8 tests/gui_smoke.py screenshots
+
+      - name: 한 파일 실행 파일 묶기 (게이트 통과 뒤에만)
+        run: python -m PyInstaller --onefile --windowed --clean --name LibraryEmergency library_emergency_circulation_app.py
+
+      - name: 실행 파일 시작 확인 (exports 폴더와 오늘 엑셀이 생기는가)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath dist\LibraryEmergency.exe -PassThru
+          $deadline = (Get-Date).AddSeconds(60)
+          $today = Get-Date -Format yyyyMMdd
+          $want = "dist\exports\도서기록_$today.xlsx"
+          while (-not (Test-Path $want) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+          $alive = -not $p.HasExited
+          if ($alive) { Stop-Process -Id $p.Id -Force }
+          Get-ChildItem dist\exports
+          if (-not (Test-Path $want)) { throw "오늘 엑셀이 생기지 않음" }
+          if (-not $alive) { throw "실행 파일이 스스로 끝남" }
+          Remove-Item -Recurse -Force dist\exports
+
+      - name: 지문(SHA-256)
+        id: hash
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist\LibraryEmergency.exe -Algorithm SHA256).Hash.ToLower()
+          $size = (Get-Item dist\LibraryEmergency.exe).Length
+          "$h  LibraryEmergency.exe" | Out-File -Encoding ascii dist\SHA256SUMS.txt
+          "sha=$h" >> $env:GITHUB_OUTPUT
+          "size=$size" >> $env:GITHUB_OUTPUT
+          Write-Output "SHA-256 $h · $size bytes"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ github.sha }}
+          path: |
+            dist/LibraryEmergency.exe
+            dist/SHA256SUMS.txt
+            gates_result.json
+            screenshots/
+
+      - name: Releases 에 올리기 (v 태그일 때만)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.hash.outputs.sha }}
+          SIZE: ${{ steps.hash.outputs.size }}
+        run: |
+          $notes = @"
+          도서관 비상 대출/반납 기록 프로그램 $env:GITHUB_REF_NAME
+
+          - 파일: LibraryEmergency.exe ($env:SIZE 바이트)
+          - SHA-256: ``$env:SHA``
+          - 빌드: GitHub Actions 윈도우 기계 · 커밋 $env:GITHUB_SHA
+          - 게이트(기록 처리 · 윈도우 파일 잠금 · 화면 스모크)를 같은 기계에서 통과한 뒤에 묶었습니다.
+
+          사용법과 「알 수 없는 게시자」 경고는 README 를 보세요.
+          "@
+          gh release create $env:GITHUB_REF_NAME dist/LibraryEmergency.exe dist/SHA256SUMS.txt --title "$env:GITHUB_REF_NAME" --notes "$notes"

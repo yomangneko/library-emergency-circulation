@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+exports/
+screenshots/
+gates_result.json
+le_gate_*/
+le_good_*/
+le_gui_*/
+.venv/
