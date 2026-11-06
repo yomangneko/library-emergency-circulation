@@ -12,3 +12,5 @@ le_gui_*/
 .venv/
 speed_result.json
 le_speed_*/
+fix_result.json
+le_fix_*/

@@ -184,10 +184,12 @@ def main():
         ext = probe(fixed_pkg, "external")
         c_secs = time.monotonic() - t0
         want_books = ["EB1", "EB3", "EB4", "EB5", "EB6"]
+        # 메모 뒤 기록: v2.0.2 사서 결정 ②나(261106) — 메모는 그대로 두고 새 기록은 이어서 적는다
+        # (v2.0.1 까지의 기대값은 「메모가 있으면 엑셀에 쓰지 않음」이었다)
         c_pass = (ext["deleted"] == "EB2" and ext["after_delete_books"] == want_books and
                   ext["after_delete_totals"].get("전체 건수") == 5 and ext["memo"] == ["메모: 3번 책 표지 파손"] and
-                  ext["after_memo_books"] == want_books and "양식" in ext["status_after_memo"] and
-                  "저장 완료" not in ext["status_after_memo"] and ext["journal_rows"] == 7)
+                  ext["after_memo_books"] == want_books + ["EB7"] and ext["status_after_memo"].startswith("저장 완료")
+                  and ext["journal_rows"] == 7 and ext["pink_rows"] == 0)
         print(f"\n[ⓒ 바깥 수정 보존]\n  {'PASS' if c_pass else 'FAIL'}  지운 줄 {ext['deleted']} → 다음 기록 뒤 엑셀 "
               f"{ext['after_delete_books']} · 합계 {ext['after_delete_totals'].get('전체 건수')} · 메모 뒤 기록 → 메모 "
               f"{ext['memo']} · 엑셀 {ext['after_memo_books']} · 상태 「{ext['status_after_memo'][:40]}…」 · "

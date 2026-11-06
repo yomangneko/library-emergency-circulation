@@ -96,6 +96,8 @@ class EmergencyLibraryApp:
         self.worker.start()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self._closed = False
+        self._closing = False
+        self._close_failures: dict = {}  # 닫는 중 엑셀에 못 옮긴 날 -> (남은 줄 수, 까닭)
         self._poll_job = self.root.after(POLL_MS, self._poll_results)
         self._tick_job = self.root.after(30_000, self._tick)
 
@@ -215,6 +217,8 @@ class EmergencyLibraryApp:
     def record(self) -> None:
         """스캔 한 건: 일지에 한 줄 → 목록 맨 위에 그 한 줄 → 다음 입력. 엑셀은 뒤쪽 일꾼이 옮긴다.
         여기서는 엑셀 파일을 읽지도 쓰지도 않는다 — 그날 건수와 상관없이 같은 시간이 든다."""
+        if self._closing:
+            return  # 닫는 중에는 새 기록을 받지 않는다(입력은 그대로 둔다)
         result = self.store.record(self.mode, self.member_var.get(), self.book_var.get(), flush=False)
         if not result.recorded and result.missing:
             self._warn_missing(result.missing)
@@ -275,6 +279,11 @@ class EmergencyLibraryApp:
                 self._poll_job = self.root.after(POLL_MS, self._poll_results)
 
     def _apply_result(self, res: core.FlushResult) -> None:
+        if self._closing:
+            if res.ok:
+                self._close_failures.pop(res.day, None)
+            else:
+                self._close_failures[res.day] = (res.pending, res.error)
         # 엑셀에 들어간 줄은 「엑셀 대기」 표시를 푼다
         for key in [k for k in self._pending_items if k[0] == res.day and k[1] < res.saved_upto]:
             iid, row = self._pending_items.pop(key)
@@ -299,8 +308,74 @@ class EmergencyLibraryApp:
                 self.set_status(*status_for(failed))
 
     def close(self) -> None:
-        """창 닫기. 엑셀 정리 중이면 잠깐 기다린다 — 다 못 기다려도 엑셀 파일은 임시 파일로 바꿔 끼우므로
-        깨지지 않고, 못 옮긴 줄은 다음 시작 때 일지에서 채운다."""
+        """창 닫기(㉷). 일꾼이 하던 정리만이 아니라 밀린 날의 줄을 모두 엑셀에 옮긴 뒤 닫는다.
+        옮기지 못하면(엑셀이 열려 있음 등) 닫기 전에 알리고 「다시 시도」와 「그냥 닫기」 중 고르게 한다.
+        알림 없이 엑셀에 없는 줄을 남긴 채 닫히는 길은 없다."""
+        if self._closing:
+            return
+        self._closing = True
+        self._close_failures = {}
+        self.set_status("닫는 중 — 일지의 기록을 엑셀에 마저 옮기고 있습니다. 끝나면 창이 닫힙니다", BUSY)
+        self._poke_all_pending()
+        self.root.after(POLL_MS, self._close_step)
+
+    def _poke_all_pending(self) -> None:
+        days = set(self.worker.pending_days())
+        try:
+            days |= set(self.store.days_with_pending())
+        except OSError:
+            pass
+        for day in days:
+            self.worker.poke(day)
+
+    def _close_step(self) -> None:
+        if self._closed:
+            return
+        settled = self.results.empty() and not self.worker.busy()
+        if settled and self.worker.idle() and not self._close_failures:
+            self._finish_close()
+            return
+        if settled and self._close_failures:
+            missing = sum(n for n, _ in self._close_failures.values() if n > 0)
+            reason = next(iter(self._close_failures.values()))[1]
+            choice = self.ask_close_choice(missing, reason)
+            if choice == "close":
+                self._finish_close()
+                return
+            self._close_failures = {}
+            self.set_status("닫는 중 — 엑셀에 다시 옮겨 보고 있습니다", BUSY)
+            self._poke_all_pending()
+        self.root.after(POLL_MS, self._close_step)
+
+    def ask_close_choice(self, missing: int, reason: str) -> str:
+        """닫기 전 알림. "retry"(엑셀을 닫고 다시 시도) 또는 "close"(그냥 닫기)를 돌려준다."""
+        win = tk.Toplevel(self.root)
+        win.title("엑셀에 아직 옮기지 못한 기록이 있습니다")
+        win.transient(self.root)
+        win.resizable(False, False)
+        answer = {"v": "retry"}  # 창의 X 는 「다시 시도」 — 닫히지 않는 쪽이 안전하다
+        text = (f"엑셀에 아직 {missing}건이 없습니다. 일지에는 모두 적혀 있습니다.\n"
+                f"({reason})\n\n"
+                "열려 있는 엑셀 파일을 닫은 뒤 「엑셀을 닫고 다시 시도」를 누르세요.\n"
+                "「그냥 닫기」를 누르면 프로그램을 다음에 켤 때 일지에서 엑셀로 채웁니다.")
+        tk.Label(win, text=text, justify="left", font=(FONT, 11), padx=16, pady=12, wraplength=520).pack()
+        bar = ttk.Frame(win, padding=(12, 0, 12, 12))
+        bar.pack(fill="x")
+
+        def pick(v):
+            answer["v"] = v
+            win.destroy()
+
+        retry = ttk.Button(bar, text="엑셀을 닫고 다시 시도", command=lambda: pick("retry"))
+        retry.pack(side="left")
+        ttk.Button(bar, text="그냥 닫기 (다음에 켤 때 채움)", command=lambda: pick("close")).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", lambda: pick("retry"))
+        retry.focus_set()
+        win.grab_set()
+        self.root.wait_window(win)
+        return answer["v"]
+
+    def _finish_close(self) -> None:
         self._closed = True
         for job in (self._poll_job, self._tick_job):
             try:

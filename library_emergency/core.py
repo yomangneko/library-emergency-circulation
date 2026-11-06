@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import re
 import tempfile
 import threading
 import time
@@ -144,19 +145,40 @@ class JournalState:
     saved_count: int = 0  # 엑셀에 옮겨 적었다고 확인된 앞쪽 줄 수
 
 
+#: 끊긴 꼬리를 봉인하는 표지. 맨 앞 글자 \x1f 는 제어 글자라 입력값에 들어갈 수 없다(normalize_input 이 걷어냄).
+TRUNCATED_SEAL = "\x1f끊김"
+TIME_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}")
+
+
+def _journal_line_ok(line: str) -> bool:
+    """끝까지 다 쓴 줄인가: 탭 말고 제어 글자가 없어야 한다(봉인 표지 · 전원 차단 뒤 0 바이트 등)."""
+    return not any(unicodedata.category(ch) == "Cc" and ch != "\t" for ch in line)
+
+
 def read_journal(path: str) -> JournalState:
+    """일지를 읽는다. 기록으로 인정하는 줄은 끝까지 다 쓴 R 줄만이다.
+
+    - 줄 끝(\\n)이 없는 마지막 줄은 쓰다 끊긴 줄이다 — 믿지 않는다.
+    - 끊긴 줄 뒤에 다음 줄을 덧붙일 때는 그 꼬리에 봉인 표지(제어 글자)를 붙여 닫는다(_append_line).
+      제어 글자가 섞인 줄 · UTF-8 이 깨진 줄 · 칸 수나 시각 형식이 어긋난 줄은 버린다.
+    - v2.0.0 · v2.0.1 이 쓴 일지도 같은 꼴(R/S 줄)이라 그대로 읽힌다.
+    """
     state = JournalState()
     if not os.path.exists(path):
         return state
-    with open(path, "r", encoding="utf-8", newline="") as fh:
+    with open(path, "rb") as fh:
         for raw in fh:
-            if not raw.endswith("\n"):
+            if not raw.endswith(b"\n"):
                 continue  # 쓰다 끊긴 마지막 줄은 믿지 않는다
-            line = raw.rstrip("\r\n")
-            if not line or line.startswith("#"):
+            try:
+                line = raw.decode("utf-8").rstrip("\r\n")
+            except UnicodeDecodeError:
+                continue  # 한글 글자 가운데서 끊긴 줄
+            if not line or line.startswith("#") or not _journal_line_ok(line):
                 continue
             parts = line.split("\t")
-            if parts[0] == "R" and len(parts) == 5 and parts[2] in KINDS:
+            if parts[0] == "R" and len(parts) == 5 and parts[2] in KINDS and TIME_RE.fullmatch(parts[1]) \
+                    and parts[4]:
                 state.rows.append(Row(parts[1], parts[2], parts[3], parts[4]))
             elif parts[0] == "S" and len(parts) >= 2 and parts[1].isdigit():
                 state.saved_count = min(int(parts[1]), len(state.rows))
@@ -174,7 +196,9 @@ def _append_line(path: str, line: str) -> None:
             if fh.tell() > 0:
                 fh.seek(-1, os.SEEK_END)
                 if fh.read(1) != b"\n":
-                    prefix = b"\n"  # 끊긴 줄 뒤에 붙지 않게
+                    # 쓰다 끊긴 꼬리가 있다 — 봉인 표지를 붙여 닫는다. 그냥 줄만 바꾸면 끊긴 꼬리가
+                    # 「끝까지 쓴 줄」처럼 읽혀 잘린 번호가 기록이 된다(㉸).
+                    prefix = (TRUNCATED_SEAL + "\n").encode("utf-8")
         fh.seek(0, os.SEEK_END)
         fh.write(prefix + line.encode("utf-8") + b"\n")
         fh.flush()
@@ -199,40 +223,56 @@ def _width(ws) -> int:
     return max(ws.max_column, 4)
 
 
-def _row_has_total_label(ws, r: int, width: Optional[int] = None) -> bool:
-    for c in range(1, (width or _width(ws)) + 1):
-        v = ws.cell(r, c).value
-        if isinstance(v, str) and v.strip() in TOTAL_LABELS:
-            return True
-    return False
+@dataclass
+class Layout:
+    rows: List[Row]  # 기록 줄(위에서부터)
+    last: int  # 마지막 기록 줄 번호(없으면 머리글 줄)
+    labels: List[Tuple[int, int, str]]  # 합계 줄 라벨 자리 (행, 열, 라벨)
 
 
-def _row_empty(ws, r: int, width: Optional[int] = None) -> bool:
-    return all(ws.cell(r, c).value in (None, "") for c in range(1, (width or _width(ws)) + 1))
+def _classify(vals: Sequence) -> Tuple[str, object]:
+    """한 줄(A열부터의 값들)을 가른다 → ("record", Row) / ("label", [(열, 라벨)]) / ("other", None).
+
+    기록 줄 판정 규칙:
+      A(처리시간)가 날짜 · 시각 값이거나 「YYYY-MM-DD HH:MM:SS」 글자이고,
+      B(구분)가 「대출」 또는 「반납」이고(앞뒤 공백 무시),
+      D(도서번호)가 비어 있지 않은 줄. C(회원번호)는 따지지 않는다(기존 판 파일).
+    합계 줄: 어느 칸이든 「전체 건수 · 대출 건수 · 반납 건수」 라벨이 있는 줄.
+    그 밖의 칸에 사람이 적은 것은 모두 메모 — 세지 않고 · 고치지 않고 · 쓰기를 막지 않는다.
+    """
+    vals = list(vals) + [None] * (4 - len(vals))
+    labels = [(i + 1, v.strip()) for i, v in enumerate(vals) if isinstance(v, str) and v.strip() in TOTAL_LABELS]
+    if labels:
+        return "label", labels
+    a, b, c, d = vals[:4]
+    if isinstance(a, _dt.datetime):
+        t = a.strftime(TIME_FORMAT)
+    elif isinstance(a, str) and TIME_RE.fullmatch(a.strip()):
+        t = a.strip()
+    else:
+        return "other", None
+    if not (isinstance(b, str) and b.strip() in KINDS):
+        return "other", None
+    book = "" if d is None else str(d)
+    if not book.strip():
+        return "other", None
+    return "record", Row(t, b.strip(), "" if c is None else str(c), book)
 
 
-def _scan_layout(ws) -> Tuple[List[Row], int]:
-    """(기록 줄들, 마지막 기록 줄 번호)를 돌려준다. 양식이 다르면 ExcelFormatError."""
+def _scan_layout(ws) -> Layout:
     rows: List[Row] = []
     last = HEADER_ROW
-    r = FIRST_DATA_ROW
-    max_row = ws.max_row
+    labels: List[Tuple[int, int, str]] = []
     width = _width(ws)
-    while r <= max_row:
-        if _row_has_total_label(ws, r, width) or _row_empty(ws, r, width):
-            break
-        vals = [ws.cell(r, c).value for c in range(1, 5)]
-        t, k, m, b = ("" if v is None else str(v) for v in vals)
-        if isinstance(vals[0], _dt.datetime):
-            t = vals[0].strftime(TIME_FORMAT)
-        rows.append(Row(t, k.strip(), m, b))
-        last = r
-        r += 1
-    # 기록 줄 아래에는 빈 줄과 합계 줄만 있어야 한다
-    for rr in range(last + 1, max_row + 1):
-        if not (_row_empty(ws, rr, width) or _row_has_total_label(ws, rr, width)):
-            raise ExcelFormatError(f"{rr}행에 예상하지 못한 내용이 있습니다")
-    return rows, last
+    for r, vals in enumerate(ws.iter_rows(min_row=FIRST_DATA_ROW, max_col=width, values_only=True),
+                             start=FIRST_DATA_ROW):
+        kind, x = _classify(vals)
+        if kind == "record":
+            rows.append(x)
+            last = r
+        elif kind == "label":
+            labels.extend((r, c, lab) for c, lab in x)
+    return Layout(rows, last, labels)
 
 
 def _style_parts():
@@ -278,38 +318,56 @@ def new_workbook(day: _dt.date, created: _dt.datetime):
     return wb
 
 
-def write_rows_and_totals(ws, existing_last: int, new_rows: Sequence[Row]) -> List[Row]:
-    """기록 줄 뒤(합계 위)에 새 줄을 적고, 합계 줄을 지우고 다시 쓴다. 전체 기록 줄을 돌려준다."""
+def write_rows_and_totals(ws, layout, new_rows: Sequence[Row]) -> List[Row]:
+    """마지막 기록 줄 바로 다음에 새 줄을 끼워 적고, 합계 줄의 숫자 칸만 다시 쓴다. 전체 기록 줄을 돌려준다.
+
+    그 아래에 있던 것(빈 줄 · 메모 · 합계 줄 · 합계 아래 메모)은 내용과 차례 그대로 아래로 밀린다.
+    합계 줄의 다른 칸 · 기록 줄 오른쪽 칸 · 머리 위 칸은 손대지 않는다.
+    """
+    if isinstance(layout, int):  # 예전 부름꼴(시험 준비용) — 지금 시트를 읽어 쓴다
+        layout = _scan_layout(ws)
     st = _style_parts()
-    # 기록 줄 아래(빈 줄 · 합계 줄)를 걷어낸다 — 끼워 넣기 대신 다시 쓰므로 합계가 어긋나지 않는다
-    for rng in list(ws.merged_cells.ranges):
-        if rng.max_row > existing_last:  # 합계 자리에 합친 칸이 있으면 먼저 푼다
-            ws.unmerge_cells(str(rng))
-    if ws.max_row > existing_last:
-        ws.delete_rows(existing_last + 1, ws.max_row - existing_last)
-    r = existing_last
-    for row in new_rows:
-        r += 1
-        for i, v in enumerate(row.key(), start=1):
-            c = ws.cell(r, i, v)
-            c.border = st["border"]
-            c.font = st["plain"]
-        ws.cell(r, 2).alignment = st["center"]
-    all_rows, last = _scan_layout(ws)
-    ws.auto_filter.ref = f"A{HEADER_ROW}:D{max(last, HEADER_ROW)}"
-    counts = (
-        len(all_rows),
-        sum(1 for x in all_rows if x.kind == KIND_LOAN),
-        sum(1 for x in all_rows if x.kind == KIND_RETURN),
-    )
-    tr = last + 2
-    for label, n in zip(TOTAL_LABELS, counts):
-        a = ws.cell(tr, 1, label)
-        b = ws.cell(tr, 2, n)
-        for c in (a, b):
-            c.font = st["bold"]
-            c.border = st["border"]
-        tr += 1
+    k = len(new_rows)
+    last = layout.last
+    labels = list(layout.labels)
+    if k:
+        # openpyxl 의 줄 끼우기는 합친 칸을 옮기지 않는다 — 아래쪽 합친 칸은 풀었다가 옮겨 다시 합친다
+        moved = []
+        for rng in list(ws.merged_cells.ranges):
+            if rng.min_row > last:
+                moved.append((rng.min_row, rng.min_col, rng.max_row, rng.max_col))
+                ws.unmerge_cells(str(rng))
+        ws.insert_rows(last + 1, k)
+        for r1, c1, r2, c2 in moved:
+            ws.merge_cells(start_row=r1 + k, start_column=c1, end_row=r2 + k, end_column=c2)
+        labels = [(r + k if r > last else r, c, lab) for r, c, lab in labels]
+        for j, row in enumerate(new_rows, start=1):
+            r = last + j
+            for i, v in enumerate(row.key(), start=1):
+                c = ws.cell(r, i, v)
+                c.border = st["border"]
+                c.font = st["plain"]
+            ws.cell(r, 2).alignment = st["center"]
+    all_rows = list(layout.rows) + list(new_rows)
+    new_last = last + k
+    ws.auto_filter.ref = f"A{HEADER_ROW}:D{max(new_last, HEADER_ROW)}"
+    counts = {
+        TOTAL_LABELS[0]: len(all_rows),
+        TOTAL_LABELS[1]: sum(1 for x in all_rows if x.kind == KIND_LOAN),
+        TOTAL_LABELS[2]: sum(1 for x in all_rows if x.kind == KIND_RETURN),
+    }
+    if labels:
+        for r, c, lab in labels:  # 숫자 칸(라벨 오른쪽)만 다시 쓴다
+            ws.cell(r, c + 1).value = counts[lab]
+    else:  # 합계 줄이 아직 없다(새 파일 등) — 맨 아래 내용 뒤 한 줄 띄고 만든다
+        tr = max(new_last, ws.max_row) + 2
+        for label in TOTAL_LABELS:
+            a = ws.cell(tr, 1, label)
+            b = ws.cell(tr, 2, counts[label])
+            for c in (a, b):
+                c.font = st["bold"]
+                c.border = st["border"]
+            tr += 1
     return all_rows
 
 
@@ -476,7 +534,8 @@ class RecordStore:
             else:
                 wb = new_workbook(day, self.clock())
                 ws = wb[SHEET_TITLE]
-            excel_rows, last = _scan_layout(ws)
+            layout = _scan_layout(ws)
+            excel_rows = layout.rows
             # 엑셀에 이미 있는 줄은 다시 적지 않는다(저장 뒤 S 줄을 못 쓰고 끊긴 경우).
             # 이미 옮겼다고 확인된 줄로 설명되지 않는 엑셀 줄만 「이미 적힌 대기 줄」로 본다.
             unexplained = Counter(r.key() for r in excel_rows) - Counter(r.key() for r in state.rows[:state.saved_count])
@@ -486,7 +545,7 @@ class RecordStore:
                     unexplained[r.key()] -= 1
                 else:
                     to_add.append(r)
-            all_rows = write_rows_and_totals(ws, last, to_add)
+            all_rows = write_rows_and_totals(ws, layout, to_add)
             self._saver(wb, xpath)
         except Exception as exc:  # 엑셀 쪽 실패는 무엇이든 기록을 잃지 않는 쪽으로
             msg = _excel_error_text(exc)
@@ -505,6 +564,19 @@ class RecordStore:
         day = self.today()
         ok, _, err = self.flush(day)
         return ok, err
+
+    def days_with_pending(self, days: int = 14) -> List[_dt.date]:
+        """최근 일지 중 엑셀에 옮겼다는 표시(S 줄)가 아직 다 안 붙은 날."""
+        out = []
+        today = self.today()
+        for i in range(days, -1, -1):
+            d = today - _dt.timedelta(days=i)
+            jp = self.journal_path(d)
+            if os.path.exists(jp):
+                st = read_journal(jp)
+                if st.saved_count < len(st.rows):
+                    out.append(d)
+        return out
 
     def recover_recent(self, days: int = 14) -> List[Tuple[_dt.date, bool, int]]:
         """시작할 때: 최근 일지 중 엑셀에 못 옮긴 줄이 있는 날을 다시 채운다."""
@@ -667,15 +739,10 @@ class ExcelWorker:
 
 def _read_rows_readonly(ws) -> List[Row]:
     rows = []
-    for i, vals in enumerate(ws.iter_rows(min_row=FIRST_DATA_ROW, max_col=4, values_only=True)):
-        vals = list(vals) + [None] * (4 - len(vals))
-        if all(v in (None, "") for v in vals):
-            break
-        if any(isinstance(v, str) and v.strip() in TOTAL_LABELS for v in vals):
-            break
-        t = vals[0].strftime(TIME_FORMAT) if isinstance(vals[0], _dt.datetime) else ("" if vals[0] is None else str(vals[0]))
-        k, m, b = ("" if v is None else str(v) for v in vals[1:4])
-        rows.append(Row(t, k.strip(), m, b))
+    for vals in ws.iter_rows(min_row=FIRST_DATA_ROW, max_col=4, values_only=True):
+        kind, x = _classify(vals)
+        if kind == "record":
+            rows.append(x)
     return rows
 
 

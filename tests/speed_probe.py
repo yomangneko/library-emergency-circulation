@@ -130,6 +130,15 @@ class Driver:
             real_destroy()
 
         self.root.destroy = destroy_logged
+        # 닫기 전 알림(v2.0.2~): 시험 쪽에서 받아 기록하고 정해 둔 답을 낸다(모달 창으로 멈추지 않게)
+        self.close_dialogs = []
+        self.close_answer = lambda n, reason: "close"
+        if hasattr(self.app, "ask_close_choice"):
+            def ask(n, reason):
+                self.close_dialogs.append({"missing": n, "reason": reason})
+                return self.close_answer(n, reason)
+
+            self.app.ask_close_choice = ask
         self.root.update()
         self.n_scans = 0
 
@@ -177,11 +186,21 @@ class Driver:
         t = self.app.tree
         return [i for i in t.get_children() if "pending" in t.item(i, "tags")]
 
-    def close(self):
+    def close(self, timeout=600):
+        """창 닫기를 누른 것과 같은 처리 → 실제로 닫힐 때까지 화면을 돌린다. 걸린 초를 돌려준다."""
+        t0 = time.monotonic()
         if hasattr(self.app, "close"):
             self.app.close()
         else:
             self.root.destroy()
+        end = t0 + timeout
+        while not getattr(self.app, "_closed", True) and time.monotonic() < end:
+            try:
+                self.root.update()
+            except self.tk.TclError:
+                break
+            time.sleep(0.02)
+        return time.monotonic() - t0
 
 
 def mode_point(args):
@@ -274,7 +293,7 @@ def mode_external(args):
     ws.cell(memo_row, 1, "메모: 3번 책 표지 파손")
     wb.save(p)
     d.scan("E1", "EB7")
-    d.settle(lambda: d.app.results.empty() and "양식" in d.app.status.cget("text"), 60)
+    d.settle(lambda: d.drained() or "일지에만" in d.app.status.cget("text"), 60)
     status = d.app.status.cget("text")
     rows2, totals2, memo2 = read_sheet(p)
     jn = journal_r(os.path.join(args.folder, jname(DAY)))
@@ -358,6 +377,55 @@ def mode_killme(args):
     return {}
 
 
+def mode_closeafter(args):
+    """㉷ (부모가 n줄을 채워 둔 날에) 5건을 0.15초 간격으로 찍고 곧바로 창 닫기 → 닫힌 뒤 프로세스가 끝난다.
+    엑셀 = 일지 대조는 부모가 프로세스가 끝난 뒤에 한다."""
+    d = Driver(args.pkg, args.folder)
+    d.start()
+    for i in range(5):
+        d.scan("C1", f"CB{i:02d}")
+        end = time.monotonic() + 0.15
+        while time.monotonic() < end:
+            d.root.update()
+            time.sleep(0.01)
+    close_secs = d.close()
+    return {"mode": "closeafter", "n": args.n, "close_secs": round(close_secs, 2), "dialogs": d.close_dialogs}
+
+
+def mode_lockclose(args):
+    """㉷ 엑셀이 잠긴 채 5건 → 창 닫기. 알림이 뜨는가. --answer close: 그냥 닫기 /
+    retry: 알림에서 잠금을 풀고 「다시 시도」 → 밀린 줄을 옮기고 닫히는가."""
+    d = Driver(args.pkg, args.folder)
+    d.start()
+    p = os.path.join(args.folder, xname(DAY))
+    real = sys.platform.startswith("win")
+    release = _win_lock(p, 1) if real else _fault_lock()
+    released = {"v": False}
+
+    def do_release():
+        if not released["v"]:
+            released["v"] = True
+            release()
+
+    try:
+        for i in range(5):
+            d.scan("L1", f"LB{i:02d}")
+        d.settle(lambda: "일지에만 기록됨" in d.app.status.cget("text"), 30)
+
+        def answer(n, reason):
+            if args.answer == "retry":
+                do_release()  # 직원이 엑셀을 닫음
+                return "retry"
+            return "close"
+
+        d.close_answer = answer
+        close_secs = d.close(timeout=120)
+    finally:
+        do_release()
+    return {"mode": "lockclose", "answer": args.answer, "real_lock": real, "close_secs": round(close_secs, 2),
+            "dialogs": d.close_dialogs, "closed": bool(getattr(d.app, "_closed", True))}
+
+
 def mode_restart(args):
     """ⓔ 다시 켬: 실제 시작 순서(main)대로 최근 일지에서 엑셀을 채운다(화면 없이)."""
     sys.path.insert(0, args.pkg)
@@ -380,9 +448,11 @@ def main():
     ap.add_argument("--n", type=int, default=0)
     ap.add_argument("--samples", type=int, default=5)
     ap.add_argument("--warm", action="store_true")
+    ap.add_argument("--answer", default="close")
     args = ap.parse_args()
     fn = {"point": mode_point, "continuous": mode_continuous, "external": mode_external, "lock": mode_lock,
-          "killme": mode_killme, "restart": mode_restart}[args.mode]
+          "killme": mode_killme, "restart": mode_restart, "closeafter": mode_closeafter,
+          "lockclose": mode_lockclose}[args.mode]
     out = fn(args)
     print("RESULT " + json.dumps(out, ensure_ascii=False), flush=True)
 

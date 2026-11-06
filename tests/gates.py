@@ -429,7 +429,8 @@ def gate_truncated_journal(d):
 
 
 def gate_unexpected_content(d):
-    """합계 아래에 사람이 적은 메모가 있으면 지우지 않고 손대지 않는다(일지에는 남음)."""
+    """합계 아래에 사람이 적은 메모: 지우지 않고(내용 그대로), 새 기록은 이어서 저장한다.
+    (v2.0.2 사서 결정 ②나 261106 — v2.0.1 까지는 메모가 있으면 저장을 멈추는 것이 기대값이었다)"""
     clk = FakeClock(START)
     s = core.RecordStore(d, clock=clk)
     s.record(T_LOAN, "M1", "B1")
@@ -440,9 +441,12 @@ def gate_unexpected_content(d):
     clk.tick(30)
     r = s.record(T_LOAN, "M2", "B2")
     wb = openpyxl.load_workbook(p)
-    memo = wb[T_SHEET]["A20"].value
-    ok = memo == "메모: 3번 책 파손" and r.recorded and not r.excel_saved and "양식" in r.error
-    return ok, f"메모 보존={memo is not None} · 저장={r.excel_saved}"
+    ws = wb[T_SHEET]
+    memos = [ws.cell(rr, 1).value for rr in range(1, ws.max_row + 1) if ws.cell(rr, 1).value == "메모: 3번 책 파손"]
+    rows, totals, _, _ = read_sheet(p)
+    ok = len(memos) == 1 and r.recorded and r.excel_saved and [x[3] for x in rows] == ["B1", "B2"] \
+        and totals.get(T_LABELS[0]) == 2
+    return ok, f"메모 보존={len(memos) == 1} · 저장={r.excel_saved} · 엑셀 {[x[3] for x in rows]} · 전체 {totals.get(T_LABELS[0])}"
 
 
 def gate_return_needs_member(d):
@@ -641,7 +645,7 @@ def main(argv):
         ("엑셀 대기 표시 · 다시 켜서 되살림", gate_pending_view_and_recovery),
         ("지운 줄을 되살리지 않음", gate_deleted_row_respected),
         ("끊긴 일지 줄", gate_truncated_journal),
-        ("합계 아래 메모 보존", gate_unexpected_content),
+        ("합계 아래 메모 보존 · 이어 적기(②나)", gate_unexpected_content),
         ("사서 칸 ①가 반납도 회원번호", gate_return_needs_member),
         ("기존 판 양식 파일에 이어 적기", gate_legacy_append),
         ("인터넷 차단 상태 시작", gate_offline),

@@ -59,11 +59,13 @@ def settle(app, root, until, timeout=30.0):
     """뒤쪽 일꾼이 엑셀을 옮기는 동안 화면을 돌리며 기다린다(시험만 기다린다 — 직원은 기다리지 않는다)."""
     end = time.monotonic() + timeout
     while time.monotonic() < end:
-        root.update()
         if until():
             return True
+        try:
+            root.update()
+        except tk.TclError:  # 창이 닫혔다
+            return until()
         time.sleep(0.02)
-    root.update()
     return until()
 
 
@@ -151,7 +153,48 @@ def main(out_dir):
             problems.append(f"건수 어긋남 화면 {n_list} · 엑셀 {n_xl} · 일지 {n_j}")
         if touched:
             problems.append(f"네트워크 시도 {len(touched)}")
-        app.close()
+        # 닫기 알림(㉷): 엑셀이 열려 있는 채 닫기 → 알림 → 엑셀을 닫고 「다시 시도」 → 밀린 줄을 옮기고 닫힘
+        from openpyxl.workbook.workbook import Workbook
+
+        orig_save = Workbook.save
+
+        def locked_save(self, filename):
+            raise PermissionError(13, "열려 있음(흉내)", filename)
+
+        Workbook.save = locked_save
+        scan(app, root, "20240004", "EM0000077777")
+        seen = {}
+
+        def answer():
+            tops = [w for w in root.winfo_children() if isinstance(w, tk.Toplevel) and w.winfo_exists()]
+            if not tops:
+                root.after(200, answer)
+                return
+            top = tops[0]
+            top.lift()
+            texts = [c.cget("text") for c in top.winfo_children() if isinstance(c, tk.Label)]
+            seen["text"] = " ".join(texts)
+            seen["shot"] = shot(top, out_dir, "5_닫기알림.png")
+            Workbook.save = orig_save  # 직원이 엑셀을 닫음
+            for frame in top.winfo_children():
+                for b in frame.winfo_children():
+                    if str(b.cget("text")).startswith("엑셀을 닫고"):
+                        b.invoke()
+                        return
+
+        root.after(300, answer)
+        app.close()  # 밀린 줄을 다 옮긴 뒤 닫힌다 — 닫힐 때까지 화면을 돌린다
+        settle(app, root, lambda: app._closed, timeout=90)
+        Workbook.save = orig_save
+        if not app._closed:
+            problems.append("창 닫기가 끝나지 않음")
+        if "엑셀에 아직 1건이 없습니다" not in seen.get("text", ""):
+            problems.append(f"닫기 알림 문구: {seen.get('text')!r}")
+        shots.append(seen.get("shot"))
+        n_xl2 = len(read_sheet(store.excel_path(day))[0])
+        n_j2 = len(journal_r_lines(store.journal_path(day)))
+        if not (n_xl2 == n_j2 == 6):
+            problems.append(f"다시 시도 뒤 닫힌 다음 엑셀 {n_xl2} · 일지 {n_j2}")
         print(f"화면 {n_list}건 · 엑셀 {n_xl}줄 · 일지 {n_j}줄 · 네트워크 시도 {len(touched)} · 사진 {[s for s in shots if s]}")
     finally:
         shutil.rmtree(folder, ignore_errors=True)

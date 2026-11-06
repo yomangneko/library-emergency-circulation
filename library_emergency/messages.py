@@ -27,7 +27,7 @@ def status_for(result: RecordResult) -> Tuple[str, str]:
     else:
         text = (
             f"일지에만 기록됨: {who} — {result.error}. "
-            f"엑셀 미반영 {result.pending}건은 엑셀을 닫으면 다음 기록 때 채워집니다"
+            f"엑셀 미반영 {result.pending}건은 엑셀을 닫으면 곧 채워집니다"
         )
         level = FAIL
     if result.duplicate_seconds is not None:
