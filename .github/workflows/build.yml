@@ -14,6 +14,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 속도 게이트의 대조군(v2.0.0 태그)을 git 에서 꺼낸다
 
       - uses: actions/setup-python@v5
         with:
@@ -24,6 +26,9 @@ jobs:
 
       - name: 게이트 (기록 처리 · 윈도우 실제 파일 잠금)
         run: python -I -X utf8 tests/gates.py --windows
+
+      - name: 속도 게이트 ⓐ~ⓔ (대조군 v2.0.0 · 화면을 띄운 채 · 윈도우 실제 파일 잠금)
+        run: python -I -X utf8 tests/speed_gates.py
 
       - name: 화면 스모크 + 사진 (인터넷 차단)
         run: python -I -X utf8 tests/gui_smoke.py screenshots
@@ -64,6 +69,7 @@ jobs:
             dist/LibraryEmergency.exe
             dist/SHA256SUMS.txt
             gates_result.json
+            speed_result.json
             screenshots/
 
       - name: Releases 에 올리기 (v 태그일 때만)
@@ -80,7 +86,7 @@ jobs:
           - 파일: LibraryEmergency.exe ($env:SIZE 바이트)
           - SHA-256: ``$env:SHA``
           - 빌드: GitHub Actions 윈도우 기계 · 커밋 $env:GITHUB_SHA
-          - 게이트(기록 처리 · 윈도우 파일 잠금 · 화면 스모크)를 같은 기계에서 통과한 뒤에 묶었습니다.
+          - 게이트(기록 처리 · 윈도우 파일 잠금 · 속도 · 화면 스모크)를 같은 기계에서 통과한 뒤에 묶었습니다.
 
           사용법과 「알 수 없는 게시자」 경고는 README 를 보세요.
           "@

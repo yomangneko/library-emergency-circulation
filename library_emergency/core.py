@@ -6,6 +6,9 @@
   3) 그날 엑셀 파일에 일지에서 아직 안 옮긴 줄을 모두 옮겨 적는다
      실패하면(엑셀이 열려 있음 · 저장 실패) 줄은 일지에 남고, 다음 저장 때 다시 채운다
 
+화면은 1)·2)만 하고 바로 다음 입력을 받는다(그날 건수와 상관없이 같은 시간).
+3)은 뒤쪽 일꾼(ExcelWorker) 하나가 맡는다 — 엑셀에 쓰는 것은 늘 그 하나뿐이다.
+
 인터넷 · 외부 프로그램을 쓰지 않는다.
 """
 
@@ -14,6 +17,8 @@ from __future__ import annotations
 import datetime as _dt
 import os
 import tempfile
+import threading
+import time
 import unicodedata
 from collections import Counter
 from dataclasses import dataclass, field
@@ -189,16 +194,21 @@ def _load_openpyxl():
     return openpyxl
 
 
-def _row_has_total_label(ws, r: int) -> bool:
-    for c in range(1, max(ws.max_column, 4) + 1):
+def _width(ws) -> int:
+    # ws.max_column 은 부를 때마다 칸 전체를 훑는다 — 줄마다 부르면 줄 수의 제곱으로 느려진다. 한 번만 센다.
+    return max(ws.max_column, 4)
+
+
+def _row_has_total_label(ws, r: int, width: Optional[int] = None) -> bool:
+    for c in range(1, (width or _width(ws)) + 1):
         v = ws.cell(r, c).value
         if isinstance(v, str) and v.strip() in TOTAL_LABELS:
             return True
     return False
 
 
-def _row_empty(ws, r: int) -> bool:
-    return all(ws.cell(r, c).value in (None, "") for c in range(1, max(ws.max_column, 4) + 1))
+def _row_empty(ws, r: int, width: Optional[int] = None) -> bool:
+    return all(ws.cell(r, c).value in (None, "") for c in range(1, (width or _width(ws)) + 1))
 
 
 def _scan_layout(ws) -> Tuple[List[Row], int]:
@@ -207,8 +217,9 @@ def _scan_layout(ws) -> Tuple[List[Row], int]:
     last = HEADER_ROW
     r = FIRST_DATA_ROW
     max_row = ws.max_row
+    width = _width(ws)
     while r <= max_row:
-        if _row_has_total_label(ws, r) or _row_empty(ws, r):
+        if _row_has_total_label(ws, r, width) or _row_empty(ws, r, width):
             break
         vals = [ws.cell(r, c).value for c in range(1, 5)]
         t, k, m, b = ("" if v is None else str(v) for v in vals)
@@ -219,7 +230,7 @@ def _scan_layout(ws) -> Tuple[List[Row], int]:
         r += 1
     # 기록 줄 아래에는 빈 줄과 합계 줄만 있어야 한다
     for rr in range(last + 1, max_row + 1):
-        if not (_row_empty(ws, rr) or _row_has_total_label(ws, rr)):
+        if not (_row_empty(ws, rr, width) or _row_has_total_label(ws, rr, width)):
             raise ExcelFormatError(f"{rr}행에 예상하지 못한 내용이 있습니다")
     return rows, last
 
@@ -341,6 +352,18 @@ class RecordResult:
     duplicate_seconds: Optional[int] = None  # 방금 같은 기록이 있었으면 몇 초 전인지
     missing: str = ""  # 입력 필요: "member" / "book"
     error: str = ""  # 기록 실패 · 엑셀 실패 까닭(화면용 짧은 말)
+    day: Optional[_dt.date] = None  # 이 줄이 적힌 날
+    index: int = -1  # 그날 일지에서 이 줄의 차례(0부터) — 엑셀에 들어갔는지 맞춰 보는 데 쓴다
+    queued: bool = False  # 엑셀 옮겨 적기를 뒤쪽 일꾼에게 맡겼다(아직 시도 전)
+
+
+@dataclass
+class FlushResult:
+    day: _dt.date
+    ok: bool
+    pending: int  # 일지에만 있고 엑셀에 아직 없는 줄 수
+    error: str = ""
+    saved_upto: int = 0  # 그날 일지 앞쪽에서 엑셀에 들어갔다고 확인된 줄 수
 
 
 @dataclass
@@ -348,6 +371,7 @@ class DayView:
     day: _dt.date
     rows: List[Tuple[Row, bool]]  # (줄, 엑셀 대기 여부) — 오래된 것이 앞
     excel_error: str = ""
+    indexes: List[int] = field(default_factory=list)  # rows 와 나란히: 엑셀 대기 줄의 일지 차례(아니면 -1)
 
 
 class RecordStore:
@@ -362,6 +386,11 @@ class RecordStore:
         self._last: Optional[Tuple[Tuple[str, str, str], _dt.datetime]] = None
         self._excel_cache: dict = {}  # day -> 마지막으로 읽은 엑셀 기록 줄
         self.last_excel_error: dict = {}
+        # 일지에 덧붙이는 것(화면의 R 줄 · 일꾼의 S 줄)이 한 줄씩만 들어가게
+        self._journal_lock = threading.Lock()
+        # 엑셀 파일을 읽고 쓰는 것은 한 번에 하나만(일꾼 · 시작 때 되살림 · 화면 목록 짓기)
+        self._excel_lock = threading.Lock()
+        self._journal_counts: dict = {}  # day -> 그날 일지 R 줄 수(처음 한 번만 읽고 그 뒤로는 셈)
 
     # -- 경로
     def excel_path(self, day: _dt.date) -> str:
@@ -374,7 +403,17 @@ class RecordStore:
         return self.clock().date()
 
     # -- 기록
-    def record(self, kind: str, member: str, book: str) -> RecordResult:
+    def journal_count(self, day: _dt.date) -> int:
+        with self._journal_lock:
+            return self._journal_count_locked(day)
+
+    def _journal_count_locked(self, day: _dt.date) -> int:
+        if day not in self._journal_counts:
+            self._journal_counts[day] = len(read_journal(self.journal_path(day)).rows)
+        return self._journal_counts[day]
+
+    def record(self, kind: str, member: str, book: str, flush: bool = True) -> RecordResult:
+        """한 건을 기록한다. flush=False 면 일지에만 적고 돌아온다(엑셀은 뒤쪽 일꾼이 옮긴다)."""
         if kind not in KINDS:
             raise ValueError(kind)
         member = normalize_input(member)
@@ -388,7 +427,10 @@ class RecordStore:
         row = Row(now.strftime(TIME_FORMAT), kind, member, book)
         try:
             os.makedirs(self.folder, exist_ok=True)
-            _append_line(self.journal_path(day), "\t".join(("R",) + row.key()))
+            with self._journal_lock:
+                index = self._journal_count_locked(day)
+                _append_line(self.journal_path(day), "\t".join(("R",) + row.key()))
+                self._journal_counts[day] = index + 1
         except OSError as exc:
             return RecordResult(False, row=row, error=f"일지에 쓸 수 없습니다 ({exc.__class__.__name__})")
 
@@ -400,18 +442,29 @@ class RecordStore:
                 dup = int(gap)
         self._last = (sig, now)
 
-        ok, pending, err = self.flush(day)
-        return RecordResult(True, row=row, excel_saved=ok, pending=pending, duplicate_seconds=dup, error=err)
+        if not flush:
+            return RecordResult(True, row=row, duplicate_seconds=dup, day=day, index=index, queued=True)
+        f = self.flush_detail(day)
+        return RecordResult(True, row=row, excel_saved=f.ok and f.saved_upto > index, pending=f.pending,
+                            duplicate_seconds=dup, error=f.error, day=day, index=index)
 
     # -- 엑셀로 옮겨 적기
     def flush(self, day: _dt.date) -> Tuple[bool, int, str]:
         """일지에서 엑셀로 아직 안 옮긴 줄을 옮긴다. (성공, 남은 줄 수, 실패 까닭)."""
+        f = self.flush_detail(day)
+        return f.ok, f.pending, f.error
+
+    def flush_detail(self, day: _dt.date) -> FlushResult:
+        with self._excel_lock:
+            return self._flush_locked(day)
+
+    def _flush_locked(self, day: _dt.date) -> FlushResult:
         jpath = self.journal_path(day)
         state = read_journal(jpath)
         pending_rows = state.rows[state.saved_count:]
         xpath = self.excel_path(day)
         if not pending_rows and os.path.exists(xpath):
-            return True, 0, ""
+            return FlushResult(day, True, 0, "", len(state.rows))
         try:
             openpyxl = _load_openpyxl()
             if os.path.exists(xpath):
@@ -438,14 +491,15 @@ class RecordStore:
         except Exception as exc:  # 엑셀 쪽 실패는 무엇이든 기록을 잃지 않는 쪽으로
             msg = _excel_error_text(exc)
             self.last_excel_error[day] = msg
-            return False, len(pending_rows), msg
+            return FlushResult(day, False, len(pending_rows), msg, state.saved_count)
         try:
-            _append_line(jpath, f"S\t{len(state.rows)}\t{self.clock():{TIME_FORMAT}}")
+            with self._journal_lock:
+                _append_line(jpath, f"S\t{len(state.rows)}\t{self.clock():{TIME_FORMAT}}")
         except OSError:
             pass  # 다음 저장 때 엑셀에 이미 있는 줄로 걸러진다
         self._excel_cache[day] = all_rows
         self.last_excel_error.pop(day, None)
-        return True, 0, ""
+        return FlushResult(day, True, 0, "", len(state.rows))
 
     def ensure_today_file(self) -> Tuple[bool, str]:
         day = self.today()
@@ -469,7 +523,12 @@ class RecordStore:
 
     # -- 화면용
     def day_view(self, day: Optional[_dt.date] = None) -> DayView:
+        """화면 목록을 처음부터 짓는다 — 시작할 때 · 날짜가 바뀔 때만 부른다(스캔마다 부르지 않는다)."""
         day = day or self.today()
+        with self._excel_lock:
+            return self._day_view_locked(day)
+
+    def _day_view_locked(self, day: _dt.date) -> DayView:
         state = read_journal(self.journal_path(day))
         excel_rows = None
         err = ""
@@ -491,12 +550,119 @@ class RecordStore:
         pending = state.rows[state.saved_count:]
         unexplained = Counter(r.key() for r in excel_rows) - Counter(r.key() for r in state.rows[:state.saved_count])
         rows = [(r, False) for r in excel_rows]
-        for r in pending:
+        indexes = [-1] * len(rows)
+        for j, r in enumerate(pending):
             if unexplained[r.key()] > 0:
                 unexplained[r.key()] -= 1
             else:
                 rows.append((r, True))
-        return DayView(day, rows, err or self.last_excel_error.get(day, ""))
+                indexes.append(state.saved_count + j)
+        return DayView(day, rows, err or self.last_excel_error.get(day, ""), indexes)
+
+
+
+# ---------------------------------------------------------------- 뒤쪽 일꾼
+
+
+class ExcelWorker:
+    """엑셀 옮겨 적기를 화면과 다른 줄(스레드)에서 맡는 일꾼 하나.
+
+    - 화면은 스캔마다 poke(그날)만 부르고 바로 돌아간다.
+    - 일꾼은 밀린 날을 하나씩 옮겨 적는다. 그사이 스캔이 더 오면 다음 번에 한꺼번에 옮긴다.
+    - 엑셀이 열려 있어 못 쓴 날은 retry_seconds 마다 스캔 없이 다시 시도한다.
+    - 엑셀 파일은 매번 다시 읽고 그 위에 적는다(기억해 둔 내용으로 덮어쓰지 않는다) —
+      사람이 그사이 지운 줄 · 적은 메모가 그대로 남는다.
+    - 결과는 on_result(FlushResult)로 알린다(일꾼의 줄에서 불린다 — 화면은 큐로 받아야 한다).
+    """
+
+    def __init__(self, store: "RecordStore", on_result: Callable[[FlushResult], None],
+                 retry_seconds: float = 3.0):
+        self.store = store
+        self.on_result = on_result
+        self.retry_seconds = retry_seconds
+        self._lock = threading.Lock()
+        self._dirty: dict = {}  # day -> 다음 시도 시각(time.monotonic)
+        self._wake = threading.Event()
+        self._stopping = False
+        self._busy = False
+        self._thread = threading.Thread(target=self._run, name="excel-worker", daemon=True)
+
+    def start(self) -> "ExcelWorker":
+        if not self._thread.is_alive():
+            self._thread.start()
+        return self
+
+    def poke(self, day: _dt.date) -> None:
+        """그날 일지에 새 줄이 있다 — 곧바로 옮겨 적게 한다."""
+        with self._lock:
+            self._dirty[day] = 0.0
+        self._wake.set()
+
+    def idle(self) -> bool:
+        """밀린 날이 없고 지금 옮겨 적는 중도 아니다."""
+        with self._lock:
+            return not self._dirty and not self._busy
+
+    def busy(self) -> bool:
+        with self._lock:
+            return self._busy
+
+    def pending_days(self) -> List[_dt.date]:
+        with self._lock:
+            return sorted(self._dirty)
+
+    def wait_idle(self, timeout: float) -> bool:
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.idle():
+                return True
+            time.sleep(0.02)
+        return self.idle()
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """멈추게 하고 timeout 초까지 기다린다. 저장 중이면 그 저장은 끝까지 간다(임시 파일 → 바꿔 끼우기).
+        다 못 기다려도 엑셀 파일은 깨지지 않는다 — 못 옮긴 줄은 다음 시작 때 일지에서 채운다."""
+        self._stopping = True
+        self._wake.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    def _next_due(self) -> Tuple[Optional[_dt.date], Optional[float]]:
+        """(지금 할 날, 그게 없으면 다음 시도까지 남은 초)."""
+        with self._lock:
+            if not self._dirty:
+                return None, None
+            now = time.monotonic()
+            day, due = min(self._dirty.items(), key=lambda kv: kv[1])
+            if due <= now:
+                self._busy = True
+                return day, None
+            return None, due - now
+
+    def _run(self) -> None:
+        while not self._stopping:
+            day, wait = self._next_due()
+            if day is None:
+                self._wake.wait(wait)
+                self._wake.clear()
+                continue
+            try:
+                res = self.store.flush_detail(day)
+            except Exception as exc:  # 일꾼은 죽지 않는다 — 다음에 다시
+                res = FlushResult(day, False, -1, _excel_error_text(exc), 0)
+            with self._lock:
+                self._busy = False
+                if res.ok and self.store.journal_count(day) <= res.saved_upto:
+                    self._dirty.pop(day, None)  # 다 옮겼다(그 뒤 스캔은 새 poke 로 다시 들어온다)
+                elif res.ok:
+                    self._dirty[day] = 0.0  # 옮기는 사이 새 줄이 왔다 — 곧바로 다시
+                else:
+                    self._dirty[day] = time.monotonic() + self.retry_seconds
+            try:
+                self.on_result(res)
+            except Exception:
+                pass
 
 
 def _read_rows_readonly(ws) -> List[Row]:

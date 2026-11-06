@@ -10,6 +10,7 @@ from .core import RecordResult
 OK = "ok"
 WARN = "warn"
 FAIL = "fail"
+BUSY = "busy"  # 일지에 적혔고 엑셀에 옮기는 중 — 아직 「저장 완료」가 아니다
 
 
 def status_for(result: RecordResult) -> Tuple[str, str]:
@@ -33,6 +34,17 @@ def status_for(result: RecordResult) -> Tuple[str, str]:
         text += f"  ※ 방금({result.duplicate_seconds}초 전) 같은 기록이 있음"
         if level == OK:
             level = WARN
+    return (text, level)
+
+
+def status_for_queued(result: RecordResult) -> Tuple[str, str]:
+    """스캔 직후(일지에 적힘 · 엑셀은 뒤쪽 일꾼이 옮기는 중). 「저장 완료」라고 하지 않는다."""
+    row = result.row
+    text = f"기록됨 · 엑셀에 옮기는 중: 회원 {row.member} / 도서 {row.book}"
+    level = BUSY
+    if result.duplicate_seconds is not None:
+        text += f"  ※ 방금({result.duplicate_seconds}초 전) 같은 기록이 있음"
+        level = WARN
     return (text, level)
 
 

@@ -10,3 +10,5 @@ le_gate_*/
 le_good_*/
 le_gui_*/
 .venv/
+speed_result.json
+le_speed_*/

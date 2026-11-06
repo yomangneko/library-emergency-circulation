@@ -15,6 +15,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
@@ -54,6 +55,22 @@ def shot(root, out_dir, name):
     return path
 
 
+def settle(app, root, until, timeout=30.0):
+    """뒤쪽 일꾼이 엑셀을 옮기는 동안 화면을 돌리며 기다린다(시험만 기다린다 — 직원은 기다리지 않는다)."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        root.update()
+        if until():
+            return True
+        time.sleep(0.02)
+    root.update()
+    return until()
+
+
+def saved(app):
+    return app.worker.idle() and app.results.empty()
+
+
 def scan(app, root, member, book):
     app.member_entry.focus_force()
     app.member_var.set(member)
@@ -80,6 +97,13 @@ def main(out_dir):
 
         scan(app, root, "20240001", "EM0000123456")
         scan(app, root, "20240001", "EM0000123457")
+        right_after = app.status.cget("text")
+        if "저장 완료" in right_after:
+            # 일꾼이 벌써 옮겼다면 맞는 말이다 — 그 줄이 지금 엑셀에 실제로 있는지 대조한다
+            books_now = [r[3] for r in read_sheet(store.excel_path(store.today()))[0]]
+            if "EM0000123457" not in books_now:
+                problems.append(f"엑셀에 들어가기 전에 저장 완료라 함: {right_after} · 엑셀 {books_now}")
+        settle(app, root, lambda: saved(app) and app.status.cget("text").startswith("저장 완료"))
         if not app.status.cget("text").startswith("저장 완료"):
             problems.append(f"대출 문구: {app.status.cget('text')}")
         shots = [shot(root, out_dir, "1_대출모드.png")]
@@ -89,19 +113,29 @@ def main(out_dir):
         if not app.mode_bar.cget("text").startswith("[ 반납 ]"):
             problems.append("F2 가 반납 모드로 바꾸지 않음")
         scan(app, root, "20240002", "EM0000099999")
+        settle(app, root, lambda: saved(app))
         shots.append(shot(root, out_dir, "2_반납모드.png"))
 
         with excel_save_fault():
             scan(app, root, "20240003", "EM0000088888")
-        text = app.status.cget("text")
-        if "일지에만 기록됨" not in text or "저장 완료" in text:
-            problems.append(f"저장 실패 문구: {text}")
-        shots.append(shot(root, out_dir, "3_저장실패표시.png"))
+            settle(app, root, lambda: "일지에만 기록됨" in app.status.cget("text"))
+            text = app.status.cget("text")
+            if "일지에만 기록됨" not in text or "저장 완료" in text:
+                problems.append(f"저장 실패 문구: {text}")
+            shots.append(shot(root, out_dir, "3_저장실패표시.png"))
+
+        # 엑셀이 다시 쓸 수 있게 되면 스캔 없이 채워진다(뒤쪽 일꾼이 다시 시도)
+        if not settle(app, root, lambda: saved(app) and app.status.cget("text").startswith("저장 완료")):
+            problems.append(f"스캔 없이 다시 채우지 않음: {app.status.cget('text')}")
 
         # 같은 책 연달아
         scan(app, root, "20240003", "EM0000088888")
+        settle(app, root, lambda: saved(app))
         if "방금" not in app.status.cget("text"):
             problems.append("겹침 스캔 알림 없음")
+        pinks = [i for i in app.tree.get_children() if "pending" in app.tree.item(i, "tags")]
+        if pinks:
+            problems.append(f"엑셀에 들어간 뒤에도 분홍 줄 {len(pinks)}")
         shots.append(shot(root, out_dir, "4_엑셀복구_겹침알림.png"))
 
         root.event_generate("<Escape>")
@@ -117,7 +151,7 @@ def main(out_dir):
             problems.append(f"건수 어긋남 화면 {n_list} · 엑셀 {n_xl} · 일지 {n_j}")
         if touched:
             problems.append(f"네트워크 시도 {len(touched)}")
-        root.destroy()
+        app.close()
         print(f"화면 {n_list}건 · 엑셀 {n_xl}줄 · 일지 {n_j}줄 · 네트워크 시도 {len(touched)} · 사진 {[s for s in shots if s]}")
     finally:
         shutil.rmtree(folder, ignore_errors=True)

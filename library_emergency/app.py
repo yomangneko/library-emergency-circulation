@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import os
+import queue
 import subprocess
 import sys
 import tkinter as tk
@@ -11,11 +12,12 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from . import core
-from .messages import FAIL, OK, WARN, missing_text, status_for
+from .messages import BUSY, FAIL, OK, WARN, missing_text, status_for, status_for_queued
 
 TITLE = "도서관 비상 대출/반납 기록 프로그램"
 MODE_COLORS = {core.KIND_LOAN: "#3498db", core.KIND_RETURN: "#e74c3c"}
-STATUS_COLORS = {OK: "#1e7e34", WARN: "#b8860b", FAIL: "#c0392b"}
+STATUS_COLORS = {OK: "#1e7e34", WARN: "#b8860b", FAIL: "#c0392b", BUSY: "#555555"}
+POLL_MS = 100  # 뒤쪽 일꾼의 결과를 화면에 옮기는 간격
 FONT = "Malgun Gothic"
 MONO = "Consolas"
 
@@ -25,6 +27,15 @@ def base_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+#: 파이썬은 한 번에 한 줄(스레드)만 돈다. 뒤쪽 일꾼이 엑셀을 정리하는 동안 화면 줄이 차례를 기다리는
+#: 시간이 길어지지 않게 차례를 넘기는 간격을 짧게 한다(기본 0.005초).
+SWITCH_INTERVAL = 0.0005
+
+
+def tune_threads() -> None:
+    sys.setswitchinterval(SWITCH_INTERVAL)
 
 
 def open_path(path: str) -> None:
@@ -67,15 +78,24 @@ def choose_export_dir(root: tk.Misc, first: core.FolderCheck) -> Optional[str]:
 
 
 class EmergencyLibraryApp:
-    def __init__(self, root: tk.Tk, store: core.RecordStore):
+    def __init__(self, root: tk.Tk, store: core.RecordStore, worker: Optional[core.ExcelWorker] = None):
         self.root = root
         self.store = store
         self.mode = core.KIND_LOAN
         self.shown_day = store.today()
+        # 엑셀 옮겨 적기는 뒤쪽 일꾼 하나가 맡는다. 결과는 큐로 받아 화면 줄에서만 화면을 고친다.
+        self.results: "queue.Queue[core.FlushResult]" = queue.Queue()
+        self.worker = worker or core.ExcelWorker(store, self.results.put)
+        self._pending_items: dict = {}  # (날, 일지 차례) -> (목록 줄 id, Row)
+        self._last_scan: Optional[core.RecordResult] = None
+        self._last_shown: Optional[tuple] = None
         self._build()
         self.set_mode(core.KIND_LOAN, announce=False)
         self.refresh_list()
         self.set_status("준비되었습니다", OK)
+        self.worker.start()
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.after(POLL_MS, self._poll_results)
         self.root.after(30_000, self._tick)
 
     # ------------------------------------------------------------ 화면 짓기
@@ -192,32 +212,97 @@ class EmergencyLibraryApp:
         (self.member_entry if missing == "member" else self.book_entry).focus_set()
 
     def record(self) -> None:
-        result = self.store.record(self.mode, self.member_var.get(), self.book_var.get())
+        """스캔 한 건: 일지에 한 줄 → 목록 맨 위에 그 한 줄 → 다음 입력. 엑셀은 뒤쪽 일꾼이 옮긴다.
+        여기서는 엑셀 파일을 읽지도 쓰지도 않는다 — 그날 건수와 상관없이 같은 시간이 든다."""
+        result = self.store.record(self.mode, self.member_var.get(), self.book_var.get(), flush=False)
         if not result.recorded and result.missing:
             self._warn_missing(result.missing)
             return
-        text, level = status_for(result)
-        self.set_status(text, level)
         if not result.recorded:
+            text, level = status_for(result)
+            self.set_status(text, level)
             # 저장되지 않았으므로 입력을 지우지 않는다 — 다시 시도할 수 있게
             messagebox.showerror("기록 실패", text, parent=self.root)
             return
+        self.worker.poke(result.day)
+        self._last_scan = result
+        self._last_shown = None
+        text, level = status_for_queued(result)
+        self.set_status(text, level)
         # 같은 회원이 여러 권을 이어서 처리하도록 회원번호는 두고 책 칸만 비운다
         self.member_var.set(result.row.member)
         self.book_var.set("")
         self.book_entry.focus_set()
-        self.refresh_list()
+        if result.day != self.shown_day:
+            self.refresh_list()  # 자정을 넘긴 첫 기록 — 그날 목록으로 새로 짓는다
+        else:
+            self._add_pending_row(result.day, result.index, result.row)
+
+    def _row_values(self, row: core.Row, pending: bool) -> tuple:
+        kind = row.kind + (" · 엑셀 대기" if pending else "")
+        shown_time = row.time[11:] if len(row.time) >= 19 else row.time
+        return (shown_time, kind, row.member, row.book)
+
+    def _add_pending_row(self, day, index: int, row: core.Row) -> None:
+        iid = self.tree.insert("", 0, values=self._row_values(row, True), tags=("pending",))
+        self._pending_items[(day, index)] = (iid, row)
 
     def refresh_list(self) -> None:
+        """목록을 처음부터 짓는다 — 시작할 때 · 날짜가 바뀔 때만."""
         view = self.store.day_view()
         self.shown_day = view.day
         self.tree.delete(*self.tree.get_children())
-        for row, pending in reversed(view.rows):  # 최근 것이 위
-            kind = row.kind + (" · 엑셀 대기" if pending else "")
-            shown_time = row.time[11:] if len(row.time) >= 19 else row.time
-            self.tree.insert("", "end", values=(shown_time, kind, row.member, row.book),
-                             tags=("pending",) if pending else ())
+        self._pending_items = {}
+        indexes = view.indexes or [-1] * len(view.rows)
+        for (row, pending), idx in zip(reversed(view.rows), reversed(indexes)):  # 최근 것이 위
+            iid = self.tree.insert("", "end", values=self._row_values(row, pending),
+                                   tags=("pending",) if pending else ())
+            if pending:
+                self._pending_items[(view.day, idx)] = (iid, row)
         self.root.title(f"{TITLE} — {view.day:%Y-%m-%d}")
+
+    def _poll_results(self) -> None:
+        try:
+            while True:
+                try:
+                    res = self.results.get_nowait()
+                except queue.Empty:
+                    break
+                self._apply_result(res)
+        finally:
+            self.root.after(POLL_MS, self._poll_results)
+
+    def _apply_result(self, res: core.FlushResult) -> None:
+        # 엑셀에 들어간 줄은 「엑셀 대기」 표시를 푼다
+        for key in [k for k in self._pending_items if k[0] == res.day and k[1] < res.saved_upto]:
+            iid, row = self._pending_items.pop(key)
+            if self.tree.exists(iid):
+                self.tree.item(iid, values=self._row_values(row, False), tags=())
+        last = self._last_scan
+        if last is None or last.day != res.day:
+            return
+        if last.index < res.saved_upto:
+            shown = ("saved", last.index)
+            if self._last_shown != shown:
+                self._last_shown = shown
+                done = core.RecordResult(True, row=last.row, excel_saved=True,
+                                         duplicate_seconds=last.duplicate_seconds)
+                self.set_status(*status_for(done))
+        elif not res.ok:
+            shown = ("failed", last.index, res.pending, res.error)
+            if self._last_shown != shown:
+                self._last_shown = shown
+                failed = core.RecordResult(True, row=last.row, excel_saved=False, pending=res.pending,
+                                           error=res.error, duplicate_seconds=last.duplicate_seconds)
+                self.set_status(*status_for(failed))
+
+    def close(self) -> None:
+        """창 닫기. 엑셀 정리 중이면 잠깐 기다린다 — 다 못 기다려도 엑셀 파일은 임시 파일로 바꿔 끼우므로
+        깨지지 않고, 못 옮긴 줄은 다음 시작 때 일지에서 채운다."""
+        try:
+            self.worker.stop(timeout=2.0)
+        finally:
+            self.root.destroy()
 
     def list_count(self) -> int:
         return len(self.tree.get_children())
@@ -227,7 +312,7 @@ class EmergencyLibraryApp:
 
     def open_today_excel(self) -> None:
         day = self.store.today()
-        self.store.flush(day)
+        self.worker.poke(day)  # 엑셀에 쓰는 것은 일꾼 하나뿐 — 화면은 맡기기만 한다
         path = self.store.excel_path(day)
         try:
             if not os.path.exists(path):
@@ -246,7 +331,7 @@ class EmergencyLibraryApp:
         """자정을 넘기면 목록과 제목을 그날 것으로 바꾼다(기록 파일은 매 기록 때 날짜로 고른다)."""
         try:
             if self.store.today() != self.shown_day:
-                self.store.ensure_today_file()
+                self.worker.poke(self.store.today())  # 그날 엑셀 만들기도 일꾼이 한다
                 self.refresh_list()
                 self.set_status(f"날짜가 바뀌었습니다 — {self.shown_day:%Y-%m-%d} 파일에 기록합니다", WARN)
         finally:
@@ -254,6 +339,7 @@ class EmergencyLibraryApp:
 
 
 def main() -> int:
+    tune_threads()
     root = tk.Tk()
     root.withdraw()
     first = core.check_export_dir(os.path.join(base_dir(), "exports"))
