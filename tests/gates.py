@@ -586,7 +586,7 @@ def _win_lock(path, share):
     return k32, h
 
 
-def win_lock_check(make, d, share):
+def win_lock_check(make, share, d):
     clk = FakeClock(START)
     s = make(d, clk)
     s.record(T_LOAN, "M1", "B1")
