@@ -373,8 +373,8 @@ def _shift_all_formulas(wb, target_sheet: str, at_row: int, k: int) -> int:
         except AttributeError:
             pass
     for dn in names:
-        if dn.name.startswith("_xlnm."):
-            continue  # 인쇄 영역 · 필터 등 엑셀 예약 이름 — 프로그램이 다시 정한다
+        if dn.name == "_xlnm._FilterDatabase":
+            continue  # 자동 거르개 자리 — 프로그램이 저장 때 다시 정한다(인쇄 영역 · 제목은 parts 가 옮긴다)
         text = dn.attr_text or ""
         try:
             new = _shift_formula_text("=" + text, target_sheet + "\x00", target_sheet, at_row, k)[1:]
@@ -386,6 +386,15 @@ def _shift_all_formulas(wb, target_sheet: str, at_row: int, k: int) -> int:
     return n
 
 
+def _plain(vals):
+    """꾸민 글자(부분 굵게 등 · rich_text 로 읽은 칸)는 글자만 — 꾸밈 없이 읽은 것과 같은 값으로 판정한다."""
+    try:
+        from openpyxl.cell.rich_text import CellRichText
+    except ImportError:  # pragma: no cover
+        return vals
+    return tuple(str(v) if isinstance(v, CellRichText) else v for v in vals)
+
+
 def _scan_layout(ws) -> Layout:
     rows: List[Row] = []
     last = HEADER_ROW
@@ -393,7 +402,7 @@ def _scan_layout(ws) -> Layout:
     width = _width(ws)
     for r, vals in enumerate(ws.iter_rows(min_row=FIRST_DATA_ROW, max_col=width, values_only=True),
                              start=FIRST_DATA_ROW):
-        kind, x = _classify(vals)
+        kind, x = _classify(_plain(vals))
         if kind == "record":
             rows.append(x)
             last = r
@@ -458,17 +467,22 @@ def write_rows_and_totals(ws, layout, new_rows: Sequence[Row]) -> List[Row]:
     last = layout.last
     labels = list(layout.labels)
     if k:
-        # openpyxl 의 줄 끼우기는 합친 칸을 옮기지 않는다 — 아래쪽 합친 칸은 풀었다가 옮겨 다시 합친다
+        # openpyxl 의 줄 끼우기는 합친 칸을 옮기지 않는다 — 끼운 자리 아래 · 걸친 합친 칸은 풀었다가 옮겨 다시 합친다
+        # (끼운 자리 이상 끝은 k 줄 아래로 · 위 끝은 그대로 — 걸친 칸은 엑셀처럼 늘어난다)
         moved = []
         for rng in list(ws.merged_cells.ranges):
-            if rng.min_row > last:
+            if rng.max_row > last:
                 moved.append((rng.min_row, rng.min_col, rng.max_row, rng.max_col))
                 ws.unmerge_cells(str(rng))
         ws.insert_rows(last + 1, k)
         # openpyxl 은 줄을 끼워도 수식의 칸 이름을 고치지 않는다 — 엑셀에서 끼운 것과 같게 고친다(㉹)
         _shift_all_formulas(ws.parent, ws.title, last + 1, k)
+        # 조건부 서식 · 드롭다운 · 차트 · 그림 · 하이퍼링크 · 줄 높이 등 직원이 붙인 부품도 같게 옮긴다(v2.0.4)
+        from . import parts
+
+        parts.move_parts(ws.parent, ws, last + 1, k)
         for r1, c1, r2, c2 in moved:
-            ws.merge_cells(start_row=r1 + k, start_column=c1, end_row=r2 + k, end_column=c2)
+            ws.merge_cells(start_row=r1 + k if r1 > last else r1, start_column=c1, end_row=r2 + k, end_column=c2)
         labels = [(r + k if r > last else r, c, lab) for r, c, lab in labels]
         for j, row in enumerate(new_rows, start=1):
             r = last + j
@@ -511,13 +525,16 @@ def read_totals(ws) -> dict:
     return out
 
 
-def save_atomic(wb, path: str) -> None:
-    """같은 폴더의 임시 파일에 다 쓴 뒤 바꿔 끼운다 — 저장 중 끊겨도 원래 파일은 온전하다."""
+def save_atomic(wb, path: str, verify: Optional[Callable[[str], None]] = None) -> None:
+    """같은 폴더의 임시 파일에 다 쓴 뒤 바꿔 끼운다 — 저장 중 끊겨도 원래 파일은 온전하다.
+    verify(임시 파일)가 예외를 내면 바꿔 끼우지 않는다(원래 파일 그대로)."""
     folder = os.path.dirname(path)
     fd, tmp = tempfile.mkstemp(prefix=".저장중_", suffix=".xlsx", dir=folder)
     os.close(fd)
     try:
         wb.save(tmp)
+        if verify is not None:
+            verify(tmp)
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
@@ -654,8 +671,13 @@ class RecordStore:
             return FlushResult(day, True, 0, "", len(state.rows))
         try:
             openpyxl = _load_openpyxl()
+            guard = None
             if os.path.exists(xpath):
-                wb = openpyxl.load_workbook(xpath)
+                # 직원이 붙인 부품 검문(v2.0.4): 저장하면 지워지거나 옮길 줄 모르는 것이 있으면 쓰지 않는다
+                from . import parts
+
+                guard = parts.Guard(xpath)
+                wb = openpyxl.load_workbook(xpath, rich_text=True)
                 if SHEET_TITLE in wb.sheetnames:
                     ws = wb[SHEET_TITLE]
                 else:
@@ -675,7 +697,9 @@ class RecordStore:
                 else:
                     to_add.append(r)
             all_rows = write_rows_and_totals(ws, layout, to_add)
-            self._saver(wb, xpath)
+            at, k = layout.last + 1, len(to_add)
+            verify = None if guard is None else (lambda tmp: guard.check_after(tmp, SHEET_TITLE, at, k))
+            self._saver(wb, xpath, verify)
         except Exception as exc:  # 엑셀 쪽 실패는 무엇이든 기록을 잃지 않는 쪽으로
             msg = _excel_error_text(exc)
             self.last_excel_error[day] = msg

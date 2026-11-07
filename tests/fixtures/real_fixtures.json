@@ -1,0 +1,9 @@
+{
+ "made_by": "Numbers Creator Studio 15.3.1 (macOS, 수행자 맥) — 씨앗 real_seed.xlsx(tests/make_real_seed.py, openpyxl 3.1.5)를 Numbers 로 열어 「Microsoft Excel」로 내보냄. 글상자는 Numbers 에서 붙임(make new text item). 2026-11-07",
+ "seed_sha256": "a8c6aed57ea4a3ba4d59d8defc0566b3239656e6a07709f99a4232713bb076c5",
+ "note": "Numbers 는 씨앗의 조건부 서식과 차트를 가져오지 않았다(내보낸 파일에 없음). 드롭다운(B5:B7)과 글상자만 Numbers 가 썼다.",
+ "files": [
+  {"file": "real_numbers_parts.xlsx", "sha256": "fbef47ee97c763adb2ee8d6094985a1cb60e2a57b8ce6b131a3fea2dd5b49971", "expect": "move", "parts": ["드롭다운(데이터 유효성)"]},
+  {"file": "real_numbers_textbox.xlsx", "sha256": "e085d8ef4d695bbb6cf7b362646d1b3745b02db2b5ebc99bb4bb6e411c900db1", "expect": "refuse", "key": "글상자", "parts": []}
+ ]
+}
