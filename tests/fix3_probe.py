@@ -706,12 +706,15 @@ REAL = os.path.join(HERE, "fixtures")
 def last_record_row(p):
     import openpyxl
 
-    ws = openpyxl.load_workbook(p, read_only=True)[T_SHEET]
-    last = 4
-    for i, row in enumerate(ws.iter_rows(min_row=5, max_col=4, values_only=True), start=5):
-        a, bb, _, d = (list(row) + [None] * 4)[:4]
-        if a not in (None, "") and isinstance(bb, str) and bb.strip() in ("대출", "반납") and d not in (None, ""):
-            last = i
+    wb = openpyxl.load_workbook(p, read_only=True)
+    try:  # 읽기 전용은 파일을 열어 둔다 — 닫지 않으면 윈도우에서 판의 저장이 「열려 있음」으로 막힌다
+        last = 4
+        for i, row in enumerate(wb[T_SHEET].iter_rows(min_row=5, max_col=4, values_only=True), start=5):
+            a, bb, _, d = (list(row) + [None] * 4)[:4]
+            if a not in (None, "") and isinstance(bb, str) and bb.strip() in ("대출", "반납") and d not in (None, ""):
+                last = i
+    finally:
+        wb.close()
     return last
 
 
